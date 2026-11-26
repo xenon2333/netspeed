@@ -1,0 +1,208 @@
+# 交叉编译 netspeed 并发布。
+#
+# 触发方式：
+#   - push 到 main / 任意 PR：跑测试 + 全平台交叉编译，产物上传为临时 artifact
+#   - push 标签 v*（如 v0.2.0）：额外汇总 SHA256 校验和并创建 GitHub Release
+#   - workflow_dispatch：手动触发（不带标签时只编译、不发布）
+#
+# 本项目只依赖 Go 标准库，因此全部目标平台都以 CGO_ENABLED=0 静态编译，
+# 交叉编译无需任何 C 工具链或 qemu。
+
+name: release
+
+on:
+  push:
+    # 按需改成你的默认分支；同时兼容 main / master。
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+# 默认只读；发布任务单独申请 contents: write。
+permissions:
+  contents: read
+
+# 同一分支的新提交取消旧任务；标签构建不取消，避免发布被打断。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  # internal/version.Version 的完整导入路径，构建时用 -ldflags -X 注入版本号。
+  VERSION_PKG: github.com/xenon2333/netspeed/internal/version
+
+jobs:
+  test:
+    name: 测试
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          # 版本直接取自 go.mod 的 go 指令，避免两处版本号漂移。
+          go-version-file: go.mod
+          # 项目零第三方依赖、没有 go.sum，模块缓存没有收益。
+          cache: false
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: gofmt 检查
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          if [[ -n "${unformatted}" ]]; then
+            echo "::error::以下文件未通过 gofmt，请本地执行 gofmt -w ."
+            echo "${unformatted}"
+            exit 1
+          fi
+
+      - name: go test
+        run: go test ./...
+
+  build:
+    name: 编译 ${{ matrix.name }}
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-amd64, goos: linux, goarch: amd64 }
+          - { name: linux-arm64, goos: linux, goarch: arm64 }
+          - { name: linux-armv6, goos: linux, goarch: arm, goarm: "6" }
+          - { name: linux-armv7, goos: linux, goarch: arm, goarm: "7" }
+          - { name: linux-386, goos: linux, goarch: "386" }
+          - { name: darwin-amd64, goos: darwin, goarch: amd64 }
+          - { name: darwin-arm64, goos: darwin, goarch: arm64 }
+          - { name: windows-amd64, goos: windows, goarch: amd64 }
+          - { name: windows-arm64, goos: windows, goarch: arm64 }
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: 解析版本号
+        id: version
+        env:
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "${REF}" == refs/tags/v* ]]; then
+            version="${REF_NAME#v}"
+          else
+            # 非标签构建：给出可辨认的开发版本号，避免冒充正式版本。
+            version="0.0.0-dev.${SHA:0:7}"
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "构建版本：${version}"
+
+      - name: 交叉编译
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: "0"
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          bin="netspeed"
+          if [[ "${GOOS}" == "windows" ]]; then bin="netspeed.exe"; fi
+          go build \
+            -trimpath \
+            -buildvcs=false \
+            -ldflags "-s -w -X ${VERSION_PKG}.Version=${VERSION}" \
+            -o "dist/${bin}" \
+            .
+          echo "产物：dist/${bin}"
+          file "dist/${bin}" || true
+
+      - name: 冒烟测试（仅 linux/amd64，在 runner 本机可直接执行）
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          got="$(./dist/netspeed --version)"
+          echo "${got}"
+          test "${got}" = "netspeed ${VERSION}"
+
+      - name: 打包
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          suffix=""
+          if [[ -n "${GOARM}" ]]; then suffix="v${GOARM}"; fi
+          name="netspeed_${VERSION}_${GOOS}_${GOARCH}${suffix}"
+          staging="pkg/${name}"
+          mkdir -p "${staging}"
+
+          bin="netspeed"
+          if [[ "${GOOS}" == "windows" ]]; then bin="netspeed.exe"; fi
+          cp "dist/${bin}" "${staging}/${bin}"
+          cp README.md "${staging}/README.md"
+
+          if [[ "${GOOS}" == "windows" ]]; then
+            ( cd pkg && zip -9 -q -r "../dist/${name}.zip" "${name}" )
+            archive="dist/${name}.zip"
+          else
+            tar -czf "dist/${name}.tar.gz" -C pkg "${name}"
+            archive="dist/${name}.tar.gz"
+          fi
+          echo "archive=${archive}"
+          ls -l "${archive}"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: netspeed-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: 发布 Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: 下载全部构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 生成 SHA256 校验和
+        run: |
+          set -euo pipefail
+          cd dist
+          # tar.gz 来自 unix 目标、zip 来自 windows 目标，两种后缀都必然存在。
+          sha256sum *.tar.gz *.zip > checksums.txt
+          cat checksums.txt
+
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
